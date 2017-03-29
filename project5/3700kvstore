@@ -1,0 +1,449 @@
+#!/usr/bin/env python
+# Chieh Lee
+# Ted Lin
+
+import sys, socket, select, time, json, random
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+# define number of majority machines
+if (len(replica_ids) % 2 == 0):
+	majority = (len(replica_ids) + 2) / 2
+else:
+	majority = ((len(replica_ids) + 1) / 2) + 1
+
+# Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+last = time.time()
+VQ_last = 0
+# 0 = Leader
+# 1 = Follower (initial state)
+# 2 = Candidate
+state = 1
+# current leader ID, initial value = 'FFFF'
+leader = 'FFFF'
+# if vote >= majority then new leader established
+vote = 0
+
+current_term = 1 			#initial value = 1
+voted_for = None			#initial value = None
+log = [{'type': 'pad', 'term': current_term, 'key': None}]
+rt_interval = [0.15, 0.30]  	#random timout interval in second
+timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+commit_index = 0
+last_applied = 0
+request_list = []
+hb_list = list(replica_ids)
+def hb_reset():
+	for x in range(len(hb_list)):
+		y = hb_list[x]
+		hb_list[x] = (y, 0)
+hb_reset()
+AE_flag = None
+
+# Volatile state for leaders:
+next_index = len(log)
+match_index = []
+
+
+# types of packets : 
+# 	VQ   : scr, dst, leader, type, term, lli (last_log_index), llt (last_log_term)
+# 	AE   : scr, dst, leader, type, l_term, pli(prev_log_index), entries, lc(leader_commit_index)
+# 	AER  : scr, dst, leader, type, l_term, pli(prev_log_index), 
+#          entries, lc(leader_commit_index), rsp
+# 	HB   : AE with empty entries
+# 	vote : scr, dst, leader, type, term, grant
+
+#  src    = source ID (string)
+#  dst    = destination ID (string)
+#  leader = leader ID (string)
+#  type   = <types of packets>
+#  term   = current term (int)
+#  grant  = grant for votes (boolean)
+#  lli    = last log index (int)
+#  llt    = last log term (int)
+#  pli    = previous log index (int)
+#  lc     = leader commit index (int)
+#  rsp    = response (boolean)
+
+
+def rv_rpc(dst, term, candidate_id, last_log_index, last_log_term):
+	msg = {'src': candidate_id, 'dst': dst, 'leader': leader, 'type': 'VQ', 
+			'term': term, 'lli': last_log_index, 'llt': last_log_term}
+	sock.send(json.dumps(msg))
+	
+
+def vote_grant(grant, dst):
+	msg = {'src': my_id, 'dst': dst, 'leader': leader, 'type': 'vote',
+			'term': current_term, 'grant': grant}
+	sock.send(json.dumps(msg))
+
+# this method is for leader only
+# send Append Entries RPC to followers (and occasionally candidates)
+# if AE raise, omit the heartbeat timeout and send packet with entries and info
+def heartbeat():
+	global hb_list
+	global AE_flag
+	if AE_flag:
+		for s in range(len(hb_list)):
+			clock = time.time()
+			dst = hb_list[s][0]
+			msg = {'src': my_id, 'dst': dst, 'leader': leader, 'type': 'AE', 'term': current_term, 
+					'pli': last_applied - 1, 'entries': AE_flag, 'lc': commit_index}
+			sock.send(json.dumps(msg))
+			hb_list[s] = (dst, clock)
+		AE_flag = []
+	else:
+		for s in range(len(hb_list)):
+			clock = time.time()
+			dst = hb_list[s][0]
+			if clock - hb_list[s][1] > rt_interval[0] / 2:
+				msg = {'src': my_id, 'dst': dst, 'leader': leader, 'type': 'AE', 'term': current_term, 
+						'pli': last_applied - 1, 'entries': [], 'lc': commit_index}
+				sock.send(json.dumps(msg))
+				hb_list[s] = (dst, clock)
+
+
+# AE RPC for follower with additional boolean value
+def append_entries_respons(rsp, dst):
+	msg = {'src': my_id, 'dst': dst, 'leader': leader, 'type': 'AER', 'term': current_term, 
+			'pli': last_applied, 'entries': [], 'lc': 0, 'rsp': rsp}
+	sock.send(json.dumps(msg))
+
+# reassemble msg to type redirect and send
+def redirect(msg):
+	msg['dst'] = msg['src']
+	msg['src'] = my_id
+	msg['leader'] = leader
+	msg['type'] = "redirect"
+	sock.send(json.dumps(msg))
+
+def find_value(req_key):
+	# find the latest value matches the key
+	result = ''
+	temp_log = list(log)
+	temp_log.reverse()
+	for x in temp_log:
+		if x['key'] == req_key:
+			result = x['value']
+			break
+	return result
+
+
+while True:
+	################
+	#   Follower   #
+	################
+	if (state == 1):
+		#print "state 1 " + my_id + ' ' + str(current_term)
+		#print my_id + ' follower len(log): ' + str(len(log))
+		ready = select.select([sock], [], [], 0.1)[0]
+
+		if sock in ready:
+			msg_raw = sock.recv(32768)
+			
+			if len(msg_raw) == 0: continue
+			msg = json.loads(msg_raw)
+			# renew the time out random period
+			
+			# For now, ignore get() and put() from clients
+			if msg['type'] in ['get', 'put']:
+				#print '%s received a put from %s' % (my_id, msg['src'])
+				redirect(msg)
+				#print '%s redirect to leader %s' % (my_id, leader)
+				timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+				last = time.time()
+			elif msg['type'] == 'vote':
+				pass
+				#print  'you shouldn\'t receive this type of packet'
+			elif msg['type'] == 'AER':
+				pass
+				#print 'and this'
+			elif msg['type'] == 'VQ':
+				pass
+				#print '%s received a vote request from %s' % (my_id, msg['src'])
+				if msg['term'] <= current_term:
+					#print 'too much ' + my_id
+					vote_grant(False, msg['src'])
+				elif voted_for != msg['src'] and voted_for != None:
+					#print 'wrong vote for ' + my_id
+					vote_grant(False, msg['src'])
+				elif msg['lli'] < commit_index:
+					#print 'wrong index ' + my_id
+					vote_grant(False, msg['src'])
+				else:
+					#print 'else ' + my_id
+					vote_grant(True, msg['src'])
+					current_term = msg['term']
+					voted_for = msg['src']
+					timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+					last = time.time()
+			# receive heartbeat from leader, 
+			elif msg['type'] == 'AE':
+				voted_for = None
+				vote = 0
+				if current_term <= msg['term']:
+					current_term = msg['term']
+					leader = msg['src']
+					if msg['lc'] >= commit_index:
+						commit_index = min(msg['lc'], len(log) - 1)
+					if not msg['entries']:
+						#print '%s received a heartbeat from %s' % (msg['dst'], msg['src'])
+						append_entries_respons(True, leader)
+						timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+						last = time.time()
+					else:				
+						#print '%s received a request from %s' % (msg['dst'], msg['src'])
+						if msg['pli'] == last_applied:
+							msg['entries']['term'] = current_term
+							log.append(msg['entries'])
+							last_applied += 1
+							append_entries_respons(True, leader)
+							timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+							last = time.time()
+						elif msg['pli'] < last_applied:
+							if msg['pli'] < commit_index:
+								print 'error: follower commit index > leader previoud log index'
+							else:
+								last_applied = msg['pli']
+								log = log[:last_applied]
+								if last_applied == len(log) - 1:
+									msg['entries']['term'] = current_term
+									log.append(msg['entries'])
+									last_applied += 1
+								else:
+									print 'error: either log or last_applied was messed up'
+							timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+							last = time.time()
+						else:
+							append_entries_respons(True, leader)
+							timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+							last = time.time()
+				else:
+					current_term = msg['term']
+					append_entries_respons(False, leader)
+		clock = time.time()
+		if clock - last > timeout_p:
+			#print 'follower time out ' + my_id
+			current_term += 1
+			vote += 1
+			voted_for = my_id
+			request_list = list(replica_ids)
+			msg = {'src': my_id, 'dst': 'FFFF', 'leader': leader, 'type': 'VQ', 
+					'term': current_term, 'lli': last_applied, 'llt': log[-1]['term']}
+			sock.send(json.dumps(msg))
+			#print '%s sending a vote request to %s' % (msg['src'], msg['dst'])
+			state = 2
+			timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+			last = clock
+			VQ_last = time.time()
+	#################
+	#   Candidate   #
+	#################
+	elif (state == 2):
+		if vote >= majority:
+			leader = my_id
+			state = 0
+			voted_for = None
+			vote = 0
+			heartbeat()
+		else:
+			ready = select.select([sock], [], [], 0.1)[0]
+
+			if sock in ready:
+				msg_raw = sock.recv(32768)
+				
+				if len(msg_raw) == 0: continue
+				msg = json.loads(msg_raw)
+				
+				# For now, ignore get() and put() from clients
+				if msg['type'] in ['get', 'put']:
+					#print '%s received a put from %s' % (my_id, msg['src'])
+					redirect(msg)
+					#print '%s redirect to leader %s' % (my_id, leader)
+					timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+					last = time.time()
+				elif msg['type'] == 'vote':
+					#print '%s received a VOTE %s from %s' % (msg['dst'], msg['grant'], msg['src'])
+					if (msg['grant']):
+						request_list.remove(msg['src'])
+						vote += 1
+				elif msg['type'] == 'VQ':
+					#print '%s received a vote request from %s' % (my_id, msg['src'])
+					if msg['term'] <= current_term:
+						vote_grant(False, msg['src'])
+					else:
+						vote_grant(True, msg['src'])
+						current_term = msg['term']
+						state = 1
+						timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+						last = time.time()
+				# receive heartbeat from leader, 
+				elif msg['type'] == 'AE':
+					voted_for = None
+					vote = 0
+					# change state to follower
+					state = 1
+					if current_term <= msg['term']:
+						current_term = msg['term']
+						leader = msg['src']
+						if msg['lc'] >= commit_index:
+							commit_index = min(msg['lc'], len(log) - 1)
+						if not msg['entries']:
+							#print '%s received a heartbeat from %s' % (msg['dst'], msg['src'])
+							append_entries_respons(True, leader)
+							timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+							last = time.time()
+						else:				
+							if msg['pli'] == last_applied:
+								msg['entries']['term'] = current_term
+								log.append(msg['entries'])
+								last_applied += 1
+								append_entries_respons(True, leader)
+								timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+								last = time.time()
+							elif msg['pli'] < last_applied:
+								if msg['pli'] < commit_index:
+									print 'error: follower commit index > leader previoud log index'
+								else:
+									last_applied = msg['pli']
+									log = log[:last_applied]
+									if last_applied == len(log) - 1:
+										msg['entries']['term'] = current_term
+										log.append(msg['entries'])
+										last_applied += 1
+									else:
+										print 'error: either log or last_applied was messed up'
+								timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+								last = time.time()
+							else:
+								append_entries_respons(True, leader)
+								timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+								last = time.time()
+					else:
+						#print 'candidate false'
+						current_term = msg['term']
+						append_entries_respons(False, leader)
+			
+			# send vote request periodically (roughy 1/3 of average of time_out)
+			clock = time.time()
+			if clock - VQ_last > timeout_p / 3:
+				for s in request_list:
+					msg = {'src': my_id, 'dst': s, 'leader': leader, 'type': 'VQ', 
+							'term': current_term, 'lli': last_applied, 'llt': log[-1]['term']}
+					sock.send(json.dumps(msg))
+					#print '%s sending a vote request to %s' % (msg['src'], msg['dst'])
+				VQ_last = clock			
+
+			# time_out, current_term increment and start all vote poll again
+			clock = time.time()
+			if clock - last > timeout_p:
+				current_term += 1
+				voted_for = None
+				vote = 0
+				VQ_last = 0
+				timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+				last = clock
+	##############
+	#   Leader   #
+	##############
+	else:
+		#print "state 0 " + my_id + ' ' + str(current_term)
+		#print my_id + ' leader len(log): ' + str(len(log))
+		heartbeat()
+		ready = select.select([sock], [], [], 0.1)[0]
+		if sock in ready:
+			msg_raw = sock.recv(32768)
+			
+			if len(msg_raw) == 0: continue
+			msg = json.loads(msg_raw)
+			# renew the time out random period
+			
+			# For now, ignore get() and put() from clients
+			if msg['type'] == 'put':
+				#print '%s received a put from %s' % (my_id, msg['src'])
+				last_applied += 1
+				msg['term'] = current_term
+				log.append(msg)
+				AE_flag = msg
+				#print AE_flag
+				msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'ok', 
+						'MID': msg['MID']}
+				#print '%s send put "OK" message to client %s' % (my_id, msg['dst'])
+				sock.send(json.dumps(msg))
+			elif msg['type'] == 'get':
+				#print '%s received a get request from %s' % (my_id, msg['src'])
+				msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'ok', 
+						'MID': msg['MID'],'value': find_value(msg['key'])}
+				sock.send(json.dumps(msg))
+				#print '%s send get "OK" message to client %s' % (my_id, msg['dst'])
+			elif msg['type'] == 'vote':
+			# you shouldn't receive this thing
+							pass
+			elif msg['type'] == 'AE':
+			# this either	                        
+							pass
+			elif msg['type'] == 'AER':
+				if msg['rsp']:
+					if msg['pli'] > commit_index:
+						if match_index == None or (msg['src'], msg['pli']) not in match_index:
+							match_index.append((msg['src'], msg['pli']))
+						if len(match_index) > majority:
+							commit_index = msg['pli']
+							match_index = []
+					elif msg['pli'] <= commit_index:
+						pass
+					elif msg['pli'] < last_applied:
+						#print 'msg[\'pli\']: ' + str(msg['pli'])
+						comp_index = msg['pli']
+						#print 'error 1'
+						msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'AE', 
+								'term': current_term, 'pli': comp_index, 'entries': log[comp_index + 1], 'lc': commit_index}
+						sock.send(json.dumps(msg))
+						for x in hb_list:
+							if x[0] == msg['scr']:
+								x[1] == time.time()
+				else:
+					#print 'my_id: ' + my_id
+					comp_index = msg['pli']
+					#print 'error 2'
+					#print 'comp_index: ' + str(comp_index)
+					#print 'len(log)' + str(len(log))
+					msg = {'src': my_id, 'dst': msg['src'], 'leader': leader, 'type': 'AE',
+							'term': current_term, 'pli': comp_index, 'entries': log[comp_index + 1], 'lc': commit_index}
+					sock.send(json.dumps(msg))
+					for x in hb_list:
+						if x[0] == msg['src']:
+							x[1] == time.time()
+			elif msg['type'] == 'VQ':
+				#print '%s received a vote request from %s' % (my_id, msg['src'])
+				if msg['term'] <= current_term:
+					#print 'too much ' + my_id
+					vote_grant(False, msg['src'])
+				elif voted_for != msg['src'] and voted_for != None:
+					#print 'wrong vote for ' + my_id
+					vote_grant(False, msg['src'])
+				elif msg['lli'] < commit_index:
+					#print 'wrong index ' + my_id
+					vote_grant(False, msg['src'])
+				else:
+					#print 'else ' + my_id
+					vote_grant(True, msg['src'])
+					current_term = msg['term']
+					voted_for = msg['src']
+					state = 1
+					timeout_p = random.uniform(rt_interval[0], rt_interval[1])
+					last = time.time()
+			# Handle noop messages. This may be removed from your final implementation
+			elif msg['type'] == 'noop':
+				print '%s received a NOOP from %s' % (msg['dst'], msg['src'])
+
+
+
