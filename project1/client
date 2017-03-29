@@ -1,0 +1,127 @@
+#!/usr/bin/env python
+
+import socket
+import argparse
+import ssl
+
+# desgin a method for calculating math expression
+# expression input should be [number_1, operator, number_2]
+def calc(slist):		
+	if ('+' in slist):
+		return int(slist[0]) + int(slist[2])
+	elif ('-' in slist):
+		return int(slist[0]) - int(slist[2])
+	elif ('*' in slist):
+		return int(slist[0]) * int(slist[2])
+	elif ('/' in slist):
+		return int(round(int(slist[0]) / int(slist[2])))
+
+
+
+
+parser = argparse.ArgumentParser(description='')
+'''
+parser.add_argument("-p", help="port number", 
+	nargs='?',const=27993, type=int, default= 27993, 
+	metavar='port_number')
+'''
+parser.add_argument("-p", help="port number", nargs ='?', const=None, type=int, default=None)
+parser.add_argument("-s", help="SSL Connection", action='store_true')
+parser.add_argument("hostname",help="hostname")
+parser.add_argument("NEUID",help="NEU_ID")
+args = parser.parse_args()
+
+neuid = args.NEUID
+host = args.hostname
+port = args.p
+
+'''
+if (args.s):
+	if port is None:
+		port = 27994
+else:
+	if port is None:
+		port = 27993
+'''
+
+buffer_size = 1024
+hello_message = "cs3700fall2016 HELLO %s\n"%(neuid)
+operators = ['+','-','*','/']
+
+try:
+	# establish a socket
+	soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+	# for extra credit
+	'''
+	if (args.s):
+		if port==27993:
+			port = 27994
+		soc = ssl.wrap_socket(soc)
+	'''
+	if (args.s):
+		if port is None:
+			port = 27994
+		soc = ssl.wrap_socket(soc)
+	else:
+		if port is None:
+			port = 27993
+		
+
+	# connect to the server
+	soc.connect((host, port))
+	# send the hello message
+	soc.send(hello_message)
+
+	while True:
+		try:
+			# receive the message
+			q = soc.recv(buffer_size)
+			
+			# if the message contains the word STATUS
+			# it is a math expression that we need to solve
+			if "STATUS" in q:
+				# the orginal message is 
+				#cs3700fall2016 STATUS [a number] [a math operator] [another number]\n
+				# we split the string at the word STATUS and take the second part
+				# [:-1] is to get rid of /n
+				expression = q.split("STATUS ")[1][:-1] 
+				
+
+				#check if it is a valid math expression
+				# check if there are three parts : number, operator and the second number
+				exlist = expression.split(" ")
+				
+				if (len(exlist) == 3 and exlist[0].isdigit() and (exlist[1] in operators) and exlist[2].isdigit()) :
+					# evaluate the expression
+					# send a message back with solution provided
+					solution_message = "cs3700fall2016 %s\n"%(str(calc(exlist)))
+					soc.send(solution_message)
+					continue
+				else:
+					print "This is not a valid math expression."
+					break
+			
+			# if it is a bye message
+			elif "BYE" in q:
+				# if the message does not contain STATUS, then it is a BYE message
+				flag = q.split("BYE ")[1]
+				print flag[:-1]
+				break
+			# if it is not a STATUS nor BYE message
+			# then return with an error
+			else:
+				print "It is neither a STATUS nor a BYE message."
+				break
+
+		except Exception,e:
+			print str(e)
+
+	# close the socket
+	soc.close()
+
+except socket.error as e:
+	print e
+
+
+
