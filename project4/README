@@ -1,0 +1,42 @@
+CS3700
+Project 4
+Hsiu-Te Lin, Chieh Lee
+
+Link to project description: http://www.ccs.neu.edu/home/cbw/3700/project4.html
+
+High Level Approach:
+
+First, we try to connect to fakebook by establishing a socket and sending a GET request. Our get_request function send listed info:
+GET /accounts/login/?next=/fakebook/ HTTP/1.1
+Host: fring.ccs.neu.edu
+Cookie: csrftoken=csrf_token; sessionid=session_id
+Connection:keep-alive
+
+When we get the respond, we take the cookie and session ID info, so later on we can send a POST request with cookie, session ID, username and password. 
+Our post_request send the listed info: 
+POST /accounts/login/?next=/fakebook/ HTTP/1.1
+Host:fring.ccs.neu.edu:80
+Referer:http://fring.ccs.neu.edu/accounts/login/?next=/fakebook/
+Cookie: csrftoken=csrf_token; sessionid=session_id
+Connection:keep-alive
+Content-Type: application/x-www-form-urlencoded
+Content-Length: len(body)
+csrfmiddlewaretoken=csrf_token&username=username&password=password&next=/fakebook/
+
+When login request is responded, we store the cookie and session id, and start crawling. When crawling, we will parse the html content, and try to find two main things: 1. other people’s portfolio url 2. secret flag. Our MyHTMLParser helps us recognize these two. 
+
+Inside the function crawl, we also handle different status code:
+200: means ok, then we feed the respond to the parser. remove this link from the list of links we need to visit
+
+403 & 404: simply remove this link 
+
+500: we break the for loop , and let it try again later
+
+301 & 302: try the request using the new URL provided at the location header. Remove the original link from the list we need to visit. Add the new link to the list we need to visit. 
+
+other code: simply just do nothing and continue
+
+the program stops once it finds all the secret flags. Otherwise it will keep crawling. 
+
+Although we successfully retrieved all the flags; many times it will time out, giving an error: RuntimeError: maximum recursion depth exceeded while calling a Python object
+We tried to figure out why, and we found out that it might be how we deal with the new profile link we find. Originally, when we find a new link, we checked if it is in the list of url that we have visited. If not, then we add to the list of url we need to visit. But we think there could be situations where a link is already in the list we need to visit, however not yet in the list we have visited. With the old code, we will add the link into the list we need to visit, causing duplicate links, and longer list. 
