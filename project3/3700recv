@@ -1,0 +1,106 @@
+#!/usr/bin/python -u
+#
+# Project 3 Starter Code
+#
+# Cheih Lee
+# Ted LIn
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+from threading import Timer, Thread
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 5
+current_sq = 0
+ack = 0
+buffa = []
+eof = False
+addr = ()
+timeout_exit = False
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = 0
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+def add_to_buffa(decoded):
+  if (not buffa or decoded['sequence'] > buffa[len(buffa) - 1]['sequence']):
+    buffa.append(decoded)
+  else:
+    for n in range(len(buffa)):
+      if (decoded['sequence'] < buffa[n]['sequence']):
+        buffa.insert(n, decoded)
+        break
+      if (decoded['sequence'] == buffa[n]['sequence']):
+        break
+
+
+def receive_data():
+  global eof
+  global addr
+  global timeout_exit
+  ## helper func to handle receiving and received data
+  while True:
+    try:
+      result = sock.recvfrom(MSG_SIZE)
+      # If nothing is ready, we hit the timeout
+      if result:
+        (data, daddr) = result
+        addr = daddr
+
+        decoded = json.loads(data)
+        msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data'])})
+        log("ABOUT TO SEND " + msg)
+        if sock.sendto(msg, addr) < len(msg):
+          log("[error] unable to fully send packet")
+        ## exit
+        if (decoded['eof']):
+          eof = True
+          break
+        else:
+          add_to_buffa(decoded)
+    except (ValueError, TypeError, KeyError) as e:
+          log("[recv corrupt packet]")
+          raise e
+    except (socket.timeout):
+      log("[error] timeout")
+      timeout_exit = True
+      break
+
+
+# Now listen for packets
+t = Thread(target=receive_data)
+t.start()
+while True:
+  if (buffa):
+    if (buffa[0]['sequence'] == current_sq):
+      decoded = buffa.pop(0)
+      log("[recv data] " + str(decoded['sequence']) + 
+        " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
+      sys.stdout.write(decoded['data'])
+      ## increment current sequence number
+      current_sq += len(decoded['data'])
+    elif (buffa[0]['sequence'] < current_sq):
+      buffa.pop(0)
+  if ((not buffa) and eof):
+    t.join()
+    log("[completed]")
+    sys.exit(0)
+  if (timeout_exit):
+    sys.exit(1)
+

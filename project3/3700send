@@ -1,0 +1,231 @@
+#!/usr/bin/python -u
+#
+# Project 3 Starter Code
+#
+# Cheih Lee
+# Ted LIn
+
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+import threading
+from threading import Timer, Thread
+import Queue
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 2.5
+SEQUENCE = 0
+retry_count = 1
+num_thread = 8
+
+## list of tuple of expect ack and stat time (for calculating RTT)
+expected_acks = []
+## list of json, received acks
+received_acks = []
+eof = False
+reach_retry_cap = False
+
+## variables for RTT & RTO
+alpha = 0.875
+RTT = 0.1 ## estimated initial value in second
+RTO = 2 * RTT
+start_time = 0.0
+end_time = 0.0
+
+## Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+#f = open('largesample')
+#fd = f.read()
+inpu = sys.stdin.read()
+
+## Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+sock.settimeout(TIMEOUT)
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+## helper fnction to calculate RTT and renew RTO
+def calculate_RTT(new_sample):
+  global RTT
+  global RTO
+  RTT = alpha * RTT + (1 - alpha) * new_sample
+  RTO = 2 * RTT
+  if (RTO < 0.01):
+    RTO = 0.01
+    sock.settimeout(RTO)
+  else:
+    sock.settimeout(RTO)
+  log("[RTT Updated] " + "new sample: " + str(new_sample) + " RTT: " + str(RTT))
+
+def calculate_RTT_from_list():
+  for i in range(len(received_acks)):
+    for j in range(len(expected_acks)):
+      if (received_acks[i] == expected_acks[j]):
+        RTT_sample = received_acks[i][1] - expected_acks[j][1]
+        calculate_RTT(RTT_sample)
+
+
+## send packet
+def send_next_packet(seq, retransmit):
+  global DATA_SIZE
+  global inpu
+  global eof
+  #data = sys.stdin.read()
+  data = inpu[seq:seq + DATA_SIZE]
+  if (len(data) > 0):
+    msg = json.dumps({"sequence": seq, "data": data, "ack": False, "eof": False})
+    start = time.time()
+    if sock.sendto(msg, dest) < len(msg):
+      log("[error] unable to fully send packet")
+    else:
+      log("[send data] " + str(seq + len(data)) + " (" + str(len(data)) + ")")
+      if (not retransmit):
+        expected_acks.append((seq + len(data), start_time))
+      log("ABOUT TO SLEEP")
+      if (not retransmit):
+        wait_for_packet()
+  else:
+    eof = True
+
+def wait_for_packet():
+  try:
+    result = sock.recvfrom(MSG_SIZE)
+    if result:
+      (data, addr) = result
+      decoded = json.loads(data)
+      if (decoded['ack']):
+        log("[recv ack] " + str(decoded['ack']))
+        #this end time will not be calculated just for type purpose ...
+        end_time = time.time()
+        received_acks.append((decoded['ack'], end_time))
+  except (ValueError, KeyError, TypeError):
+    log("[recv corrupt packet]")
+  except (socket.timeout):
+    log("[Timeout] Did not receive ack")
+
+
+
+
+## sort list of tuple (by expected/received acks)
+def sort_by_acks():
+  expected_acks.sort(key=lambda tup: tup[0])
+  received_acks.sort(key=lambda tup: tup[0])
+
+def clear_acks():
+  global expected_acks
+  global received_acks
+  expected_acks = []
+  received_acks = []
+
+## return list of number (sequence) that needs retransmission
+## and retransmit until get the corresponding ack
+def dropped_seqs():
+  global SEQUENCE
+  global retry_count
+  e_acks = []
+  r_acks = []
+  ## transport acks from tuple to a local list
+  for n in range(len(expected_acks)):
+    e_acks.append(expected_acks[n][0])
+  for m in range(len(received_acks)):
+    r_acks.append(received_acks[m][0])
+  ## create list contain only dropped acks
+  dropped = [item for item in e_acks if item not in r_acks]
+  ## special case: if this first of list is dropped
+  ## we need to pass the unchanged seq
+  if dropped:
+    if (dropped[0] == e_acks[0]):
+      dropped.pop(0)
+      retransmission(SEQUENCE, e_acks[0])
+    for i in range(len(dropped)):
+      for j in range(len(e_acks)):
+        if (dropped[i] == e_acks[j]):
+          retransmission(e_acks[j-1], e_acks[j])
+    sort_by_acks()
+    SEQUENCE = received_acks[len(received_acks)-1][0]
+  else:
+    if (received_acks):
+      SEQUENCE = received_acks[len(received_acks)-1][0]
+
+
+
+## retransmit the data, look for specific ack
+def retransmission(seq, expected):
+    global retry_count
+    global reach_retry_cap
+    log("[Retransmit] expect ack: " + str(expected))
+    start = time.time()
+    send_next_packet(seq, True)
+    while True:
+      try:
+        result = sock.recvfrom(MSG_SIZE)
+        if result:
+          start = time.time()
+          (data, addr) = result
+          decoded = json.loads(data)
+          if (decoded['ack'] == expected):
+            log("[recv ack] " + str(expected))
+            end = time.time()
+            retry_count = 1
+            calculate_RTT(end - start)
+            received_acks.append((decoded['ack'], end_time))
+            break
+      except (ValueError, KeyError, TypeError):
+        log("[recv corrupt packet]")
+      except (socket.timeout):
+        log("[Timeout] Retry (" + str(retry_count) + ") ...")
+        retry_count += 1
+        start = time.time()
+        send_next_packet(seq, True)
+        if (retry_count == -1):
+          reach_retry_cap = True
+          break
+
+## start # of thread accordingly to send packets
+def sw():
+  global SEQUENCE
+  global DATA_SIZE
+  next_seq = SEQUENCE
+  threads = []
+  for x in range(num_thread):
+    t = Thread(target=send_next_packet, args=(next_seq, False))
+    t.start()
+    next_seq += DATA_SIZE
+    threads.append(t)
+    #time.sleep(0.02)
+  for t in threads:
+    t.join()
+
+
+# Send first threads of packets
+sw()
+# Now read in data, send packets
+while True:
+  if (not eof and len(expected_acks) != num_thread):
+    log("[error] data did not send")
+    sys.exit(1)
+  if (len(received_acks) > len(expected_acks)):
+    log("[error] must be ghost")
+  sort_by_acks()
+  calculate_RTT_from_list()
+  dropped_seqs()
+  if (eof and len(expected_acks) == 0):
+    break
+  if (reach_retry_cap):
+    log("[Reach retry cap] exit(1)")
+    sys.exit(1)
+  clear_acks()
+  sw()
+
+sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+log("[complete]")
+sys.exit(0)
