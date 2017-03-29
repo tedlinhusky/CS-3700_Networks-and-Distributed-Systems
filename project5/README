@@ -1,0 +1,14 @@
+CS3700
+Project 1
+Hsiu-Te Lin, Chieh Lee
+
+Link to project description: http://www.ccs.neu.edu/home/cbw/3700/project5.html
+
+General result:
+Our implementation so far does pass all unreliable and advanced cases. 
+
+High-level approach:
+
+We followed the Raft paper in general. We separated the implementation into three main cases: leader, follower, and candidate. In each of the cases, we deal with different types of packets including get and put from the clients and the others that have to do with the leader and the replicates. 
+
+We did not have enough time to figure out a complete implementation for advanced and partition cases, and we will keep looking into it after the project submission. 
