@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+
+import socket
+import argparse
+import ssl
+import sys
+import gzip
+import re
+from HTMLParser import HTMLParser
+from StringIO import StringIO
+
+#sys.stdout = open("file2", "w")
+
+'''
+Cookie Management - Fakebook uses cookies to track whether clients are logged in to the site. 
+If your crawler successfully logs in to Fakebook using an HTTP POST, 
+Fakebook will return a session cookie to your crawler. 
+Your crawler should store this cookie, and submit it along with each HTTP GET request as it crawls Fakebook. 
+If your crawler fails to handle cookies properly, 
+then your software will not be able to successfully crawl Fakebook.
+'''
+buffer_size = 10000
+host_url = "fring.ccs.neu.edu"
+resource_url = "/fakebook/"
+login_url = "/accounts/login/?next=/fakebook/"
+port = 80
+username= ""
+password = ""
+csrf_token = ""
+session_id = ""
+secret_flags = []
+
+
+# create two url list
+# url_list keeps track of the urls we need to crawl
+url_list = []
+# url_visited keeps track of the urls we visited already in order to prevent loops
+url_visited = ["/fakebook/"]
+# use secret_flags to store all the flags found
+secret_flags = []
+
+
+# create a subclass and override the handler methods
+# need to focus on parsing two things
+# 1. someone else's profile
+# 2. secret flag
+# an example of secret flag format is
+# <h3 class='secret_flag' style="color:red">FLAG: 64-characters-of-random-alphanumerics</h3>
+class MyHTMLParser(HTMLParser):
+	# attribute secret_flag_huh
+	# will turn to true when find a secret flag
+	secret_flag_huh = False
+	# an example of profile is </p><ul><li><a href="/fakebook/371736393/">Nikita Plihell</a>
+	def handle_starttag(self, tag, attrs):
+		global url_list
+		global url_visited
+		if tag == "a":
+			#attrs is a list of (name, value) pairs 
+			for name, value in attrs:
+				if name == "href":
+					# then add the vlaue (ex: /fakebook/371736393/) to the list of url we need to crawl
+					
+					# make sure the link starts with /fakebook/
+					# THIS IS FOR THE FUNCTION: ONLY CRAWL THE TARGET DOMAIN
+					# in regular expression, special characters:
+					# .: this matches any characters except a new line
+					# *: Causes the resulting RE to match 0 or more repetitions of the preceding RE, 
+					# as many repetitions as are possible. ab* will match a, ab, or a followed by any number of b.
+					value_match = re.search('/fakebook/', value)
+					if value_match != None:
+						value_match = re.search('/fakebook/.*', value)
+						new_link = value_match.group()
+						#print "The new_link is " + new_link
+
+						# if the new_link is already in the url_visited then ignore it
+						# other wise add it to url_list
+						if new_link in url_visited:
+							pass
+						else:
+							if new_link in url_list:
+								pass
+							else:
+								url_list.append(new_link)
+
+		# if it is a secret flag
+		# According to Piazza discussion, 
+		# secret flag's tags could be H2 or H3
+		elif tag == "h2" or tag == "h3":
+			for name, value in attrs:
+				if name== "class" and value=="secret_flag":
+					#print "one flag found"
+					self.secret_flag_huh = True
+					
+
+
+	# use handle_data to deal with secret flag
+	def handle_data(self, data):
+		global secret_flags
+		if self.secret_flag_huh == True:
+			# flag's format: FLAG: 64-characters-of-random-alphanumerics
+			# ignore FLAG: 
+			if "FLAG: " in data:
+				secret_flag = data[6:]
+				if secret_flag in secret_flags:
+					pass
+				else:
+					#print secret_flag
+					secret_flags.append(secret_flag)
+					# reset secret_flag_huh back to false
+					self.secret_flag_huh = False
+
+
+# start crawling html pages
+def start_connect():
+	# establish a socket
+	soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	# connect to fakebook
+	soc.connect((host_url, port))
+
+	# send GET request and get respond in order to login
+	resp_for_get = get_request(login_url, soc)
+
+	# get session id
+	get_session_id(resp_for_get)
+
+
+	# send Post request to log in 
+	resp_for_post = post_request(soc)
+
+	# get session id
+	get_session_id(resp_for_post)
+	soc.close()
+	# start crawling the pages and get the secret flags
+	crawl()
+
+
+def crawl():
+
+	global url_list
+	global url_visited
+	global secret_flags
+	# establish a socket
+	soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	# connect to fakebook
+	soc.connect((host_url, port))
+
+
+	#link = "/fakebook/"
+	#send a GET request and get the response
+	# http://fring.ccs.neu.edu/fakebook/ is the url we want to connect to
+	# /fakebook/ is the resource
+	# http://fring.ccs.neu.edu is the host
+	r = get_request(resource_url, soc)
+	#create an instance of HTML Parser for links
+	par = MyHTMLParser()
+	#feed response to parser
+	par.feed(r)
+	#create an instance of HTML Parser for secret flags
+
+	
+	if len(url_list) == 0:
+		print "No more url to visit before finding all the secret flags"
+		for flag in secret_flags:
+			print flag
+		exit()
+
+	else:
+
+		# repeat what we have done for new links we find
+		for link in url_list:
+			new_get_res = get_request(link, soc)
+			
+
+			# if status code is
+
+			#200
+			if check_status_code(new_get_res) == 200:
+				# proceed as normal
+				if link in url_list:
+					url_list.remove(link)
+				url_visited.append(link)
+				par.feed(new_get_res)
+				
+
+			# 403 or 404
+			elif check_status_code(new_get_res) == 403 or check_status_code(new_get_res) == 404:
+				#Our web server may return these codes in order to trip up your crawler. 
+				#In this case, your crawler should abandon the URL that generated the error code.
+				url_list.remove(link)
+				url_visited.append(link)
+				continue
+
+			# 500
+			elif check_status_code(new_get_res) == 500:
+				# Internal Server Error
+				# retry GET request
+				break
+
+			# 301
+			elif check_status_code(new_get_res) == 301 or check_status_code(new_get_res) == 302 :
+				# try the request again using the new URL given by the server in the Location header
+				# add the new location to url_list
+				# remove this link from url_list and add it to url_visited
+				# only allowed to crawl
+				calc_session_id(new_get_res)
+				# Search for Location header
+				# not sure if this is correct
+				# regular expression can be complicated
+				new_location_match = re.search(r'[.\s]*Location: .*', new_get_res)
+				if new_location_match != None:
+					new_location = re_match.group()[10:]
+				 	if new_location not in url_list:
+				 		url_list(new_location)
+				 		
+				url_list.remove(link)
+				url_visited.append(link)
+				continue
+
+				'''
+				print new_get_res
+				new_location_match = re.search(r'Location: .*', new_get_res)
+				if new_location_match != None:
+					new_location = new_location_match.group()[10: ]
+					print "New Location: " + new_location + " !!!!!!!!!!!!!!!!!!!!!"
+					url_list.remove(link)
+					url_visited.append(link)
+					url_list.append(new_location)
+				'''
+
+
+			#other code
+			else:
+				#print "Receive code " + str(check_status_code(new_get_res))
+				#url_list.remove(link)
+				#url_visited.append(link)
+				pass
+
+			# check if we find all the secret flags
+			# if we do, print all the flags and exit
+			if len(secret_flags) == 5:
+				for flag in secret_flags:
+					print flag
+				exit()
+
+	soc.close()
+
+	# keep crawling until all flags are found
+	crawl()
+
+
+
+
+# take the respond and return the status code
+def check_status_code(res):
+	if "200 OK" in res:
+		return 200
+	elif "301 Moved Permanently".lower() in res.lower():
+		return 301
+	elif "302 Found".lower() in res.lower():
+		return 302
+	elif "403 Forbidden".lower() in res.lower():
+		return 403
+	elif "404 Not Found".lower() in res.lower():
+		return 404
+	elif "500 Internal Server Error".lower() in res.lower():
+		return 500
+	else:
+		#print res[:50]
+		'''
+		code_match = re.search(r'HTTP/.*', res)
+		if code_match != None:
+			other_code = code_match.group()[9:]
+			return other_code
+		'''
+		return 0
+		
+
+
+def get_session_id(resp):
+	'''
+	An example of respond from http would be:
+
+	HTTP/1.1 200 OK
+	Date: Sat, 05 Nov 2016 15:42:41 GMT
+	Server: Apache/2.2.22 (Ubuntu)
+	Content-Language: en-us
+	Expires: Sat, 05 Nov 2016 15:42:41 GMT
+	Vary: Cookie,Accept-Language,Accept-Encoding
+	Cache-Control: max-age=0
+	Set-Cookie: csrftoken=f093ed24fc7a752cb4e492c7b8676b15; expires=Sat, 04-Nov-2017 15:42:41 GMT; Max-Age=31449600; Path=/
+	Set-Cookie: sessionid=a234d052a74bb246ee228248b3d8c6ba; expires=Sat, 19-Nov-2016 15:42:41 GMT; Max-Age=1209600; Path=/
+	Last-Modified: Sat, 05 Nov 2016 15:42:41 GMT
+	Content-Length: 1152
+	Keep-Alive: timeout=5, max=100
+	Connection: Keep-Alive
+	Content-Type: text/html; charset=utf-8
+	'''
+	# need to extract csrftoken and sessionid
+	# use regular expression
+	# use prefix r , meaning that a string will be treated as a raw string, which means all escape codes will be ignored
+	# [a-zA-Z0-9] matches any letter or digit
+	# session id and csrtftoken are both 32 bits
+	csrf_match = re.search(r'csrftoken=[A-Za-z0-9]{32}', resp)
+	session_match = re.search(r'sessionid=[A-Za-z0-9]{32}', resp)
+	# search will scan through string and look for a location where this regular expression produces a match
+	# Return a corresponding Matchobject instance
+	# return None if no position in the string matches the pattern
+
+	# use group to return the string that is a match
+	if csrf_match != None:
+		global csrf_token
+		csrf_token = csrf_match.group()[10:]
+	if session_match != None:
+		global session_id
+		session_id = session_match.group()[10:]
+
+
+# GET REQUEST for a given url link
+# input: link = url link, s = socket used for connection
+def get_request(link, s):
+	'''
+	HTTP GET EXAMPLE
+
+	GET  link HTTP/1.1
+	Host: fakebook_link
+	Connection: keep-alive
+	Cookie: csrftoken=[csrf_token]; sessionid=[session_id]
+	'''
+
+	'''
+	\r\n is the standard newline sequence used by telnet protocol
+	'''
+	
+	global host_url
+	global csrf_token
+	global session_id 
+	# to keep track o=how many get request
+	global buffer_size
+	get_message = "GET " + link + " HTTP/1.1\r\nHost: " + host_url + "\r\nConnection: keep-alive\r\nCookie: csrftoken=" + csrf_token + "; sessionid= " + session_id + "\r\n\r\n"
+	s.sendall(get_message)
+	resp = s.recv(buffer_size)
+	#print resp
+	return resp
+
+# POST REQUEST to provdie login info
+# input : s = socket used for connection 
+def post_request(s):
+	#global host_url
+	global csrf_token
+	global session_id 
+	global buffer_size
+	global username
+	global password
+	
+	# provide the log in inforamtion
+	# An example of Post request would be:
+	'''
+	POST '/accounts/login/?next=/fakebook/' HTTP/1.1
+	HOST:
+	Connectiion:
+	Content-type: application/x-www-form-urlencoded (This is the default content type. )
+	Content-Length:
+	Referer:
+	Cookie:
+
+	body
+	''' 
+
+	body = "csrfmiddlewaretoken="+csrf_token+"&username="+username+"&password="+password+"&next=%2Ffakebook%2F"
+	post_message = "POST " + login_url +" HTTP/1.1\r\n" + "Host:" + host_url + ":" + str(port) + "\r\nConnection:keep-alive\r\nContent-Type:application/x-www-form-urlencoded\r\nContent-Length:" +str(len(body)) + "\r\nReferer:http://" + host_url + login_url + "\r\nCookie:csrftoken="+csrf_token+"; sessionid="+session_id+"\r\n\r\n"+ body +"\r\n"
+	s.sendall(post_message)
+	resp = s.recv(buffer_size)
+	#print resp
+	return resp 
+
+
+if __name__ == "__main__":
+
+	parser = argparse.ArgumentParser(description='')
+	parser.add_argument("username",help="username")
+	parser.add_argument("password",help="password")
+	args = parser.parse_args()
+
+	username = args.username
+	password = args.password
+	start_connect()
+
+
+
+	
