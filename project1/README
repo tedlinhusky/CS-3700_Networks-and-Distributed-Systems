@@ -1,0 +1,7 @@
+CS3700
+Project 1
+Hsiu-Te Lin, Chieh Lee
+
+Link to project description: http://www.ccs.neu.edu/home/cbw/3700/project1.html
+
+We started this project by creating a socket that connects to ccis server providing host, port and NEUID in the script, and tried to sent the hello message. We leveraged course documents and python documents to figure out how to establish the connection. Once we know the connection works, we design a calc method that help us calculate the math expression. We check if the message received has the word STATUS in it, and it is a valid math expression, with two numbers and one operator (+, -, *, /), then do calc. Once we calculate it, we send a message back with the solution, and receive the next message. we continue doing this until we get the bye message with a flag. If it is neither a STATUS nor BYE message, then it should give an error. After retrieve the flag successfully, it will close the socket. 
